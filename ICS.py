@@ -3,10 +3,11 @@ import argparse
 import csv
 import datetime
 import shutil
+import pickle
 
 import networkx as nx
 import pandas as pd
-import scipy
+from scipy import io
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.neighbors import kneighbors_graph
@@ -41,7 +42,7 @@ def generateMat():
     for s in filenames:
         os.remove('data_ICS/processed/' + s)
 
-    raw_frequency = scipy.io.loadmat(raw_file)
+    raw_frequency = io.loadmat(raw_file)
     raw = raw_frequency['R']
 
     # mask, get mask Mat
@@ -60,7 +61,7 @@ def generateMat():
         mask = np.ones(raw.shape)
         mask[x[i]] = 0
         dic['mask' + str(i)] = mask
-    scipy.io.savemat(blind_mask_mat_file, dic)
+    io.savemat(blind_mask_mat_file, dic)
 
 
 def split_data(tenfold=False):
@@ -68,9 +69,9 @@ def split_data(tenfold=False):
     读取./data_ICS/processed/blind_mask_mat.mat，根据原始频率矩阵生成10份被mask的频率矩阵并yield
     :return:
     """
-    raw_frequency = scipy.io.loadmat(raw_file)
+    raw_frequency = io.loadmat(raw_file)
     print('******************')
-    blind_mask_mat = scipy.io.loadmat(blind_mask_mat_file)
+    blind_mask_mat = io.loadmat(blind_mask_mat_file)
     drug_dict, drug_smile = load_drug_smile(SMILES_file)
     print(len(drug_dict))
 
@@ -81,7 +82,7 @@ def split_data(tenfold=False):
 
         index = np.asarray(np.where(mask[:, 0].flatten() == 0)[0]).tolist()
 
-        frequencyMat = np.delete(raw, index, axis=0)
+        frequencyMat = np.delete(raw, index, axis=0).astype(bool).astype(np.int_)
         print(len(frequencyMat))
         test_smiles = []
         test_label = []
@@ -93,7 +94,7 @@ def split_data(tenfold=False):
         train_smiles = drug_smile
         test_smiles.reverse()
         test_label.reverse()
-        test_label = np.asarray(test_label)
+        test_label = np.asarray(test_label).astype(bool).astype(np.int_)
 
         train_simle_graph = convert2graph(train_smiles)
         test_simle_graph = convert2graph(test_smiles)
@@ -147,6 +148,12 @@ def predict(model, device, loader, sideEffectsGraph, DF, not_FC):
     # 对于tensor的计算操作，默认是要进行计算图的构建的，在这种情况下，可以使用with torch.no_grad():来强制之后的内容不进行计算图构建
     total_preds = torch.Tensor()
     total_labels = torch.Tensor()
+
+    # for doc
+    indices = []
+    outs = torch.Tensor()
+    labels = torch.Tensor()
+
     with torch.no_grad():
         sideEffectsGraph = sideEffectsGraph.to(device)
         for batch_idx, data in enumerate(loader):
@@ -160,7 +167,16 @@ def predict(model, device, loader, sideEffectsGraph, DF, not_FC):
 
             total_preds = torch.cat((total_preds, pred.cpu()), 0)
             total_labels = torch.cat((total_labels, label.cpu()), 0)
-    return total_labels.numpy().flatten(), total_preds.numpy().flatten()
+
+
+            indices.append(data.index[0][0])
+            outs = torch.cat((outs, out.cpu()), 0)
+            labels = torch.cat((labels, raw_label.cpu()), 0)
+
+
+    pkgs = indices, outs, labels
+
+    return total_labels.numpy().flatten(), total_preds.numpy().flatten(), pkgs
 
 
 def evaluate(model, device, loader, sideEffectsGraph, DF, not_FC, result_folder, id):
@@ -297,11 +313,11 @@ def main(modeling, metric, train_batch, lr, num_epoch, knn, weight_decay, lamb, 
     edges = np.array(edges).T
     edges = torch.tensor(edges, dtype=torch.long)
 
-    node_label = scipy.io.loadmat(side_effect_label)['node_label']
+    node_label = io.loadmat(side_effect_label)['node_label']
     feat = torch.tensor(node_label, dtype=torch.float)
     sideEffectsGraph = Data(x=feat, edge_index=edges)
 
-    raw_frequency = scipy.io.loadmat(raw_file)
+    raw_frequency = io.loadmat(raw_file)
     raw = raw_frequency['R']
 
     # make data_WS Pytorch mini-batch processing ready
@@ -340,7 +356,7 @@ def main(modeling, metric, train_batch, lr, num_epoch, knn, weight_decay, lamb, 
         # test_rMSE.append(ret_test[2])
         # test_spearman.append(ret_test[3])
         # test_MAE.append(ret_test[4])
-    test_labels, test_preds = predict(model=model, device=device, loader=test_loader,
+    test_labels, test_preds, pkgs = predict(model=model, device=device, loader=test_loader,
                                       sideEffectsGraph=sideEffectsGraph, DF=DF, not_FC=not_FC)
     ret_test = [mse(test_labels, test_preds), pearson(test_labels, test_preds), rmse(test_labels, test_preds),
                 spearman(test_labels, test_preds), MAE(test_labels, test_preds)]
@@ -353,6 +369,9 @@ def main(modeling, metric, train_batch, lr, num_epoch, knn, weight_decay, lamb, 
                                                                                                          not_FC=not_FC,
                                                                                                          result_folder=result_folder,
                                                                                                          id=id)
+
+
+
     if save_model:
         checkpointsFolder = result_folder + '/checkpoints/'
         isCheckpointExist = os.path.exists(checkpointsFolder)
@@ -449,7 +468,7 @@ if __name__ == '__main__':
         shutil.rmtree(result_folder)
         os.makedirs(result_folder)
 
-    raw_frequency = scipy.io.loadmat(raw_file)
+    raw_frequency = io.loadmat(raw_file)
     raw = raw_frequency['R']
     pred_result = result_folder + '/blind_pred.csv'
     pred_ = pd.DataFrame(columns=[i for i in range(raw.shape[1])])
@@ -459,7 +478,7 @@ if __name__ == '__main__':
     raw_.to_csv(raw_result, header=True, index=False)
 
     result_log = result_folder + '/' + modeling.__name__ + '_result.csv'
-    raw_frequency = scipy.io.loadmat(raw_file)
+    raw_frequency = io.loadmat(raw_file)
     raw = raw_frequency['R']
 
     with open(result_log, 'w', newline='') as f:
